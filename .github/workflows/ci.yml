@@ -106,7 +106,7 @@ jobs:
         with:
           activate-environment: modin
           environment-file: environment.yml
-          python-version: 3.6
+          python-version: 3.8
           channel-priority: strict
           use-only-tar-bz2: true # IMPORTANT: This needs to be set for caching to work properly!
       - name: Conda environment
@@ -285,7 +285,7 @@ jobs:
         run: pytest modin/experimental/engines/omnisci_on_ray/test/test_dataframe.py
       - shell: bash -l {0}
         run: bash <(curl -s https://codecov.io/bash)
-  
+
   test-asv-benchmarks:
     needs: [lint-commit, lint-flake8, lint-black, test-api, test-headers]
     runs-on: ubuntu-latest
