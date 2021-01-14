@@ -41,9 +41,10 @@ from pandas.core.indexing import convert_to_index_sliceable
 from pandas.util._validators import validate_bool_kwarg, validate_percentile
 from pandas._libs.lib import no_default
 from pandas._typing import (
+    IndexKeyFunc,
+    StorageOptions,
     TimedeltaConvertibleTypes,
     TimestampConvertibleTypes,
-    IndexKeyFunc,
 )
 import re
 from typing import Optional, Union
@@ -1297,6 +1298,7 @@ class BasePandasDataset(object):
         convert_string: bool = True,
         convert_integer: bool = True,
         convert_boolean: bool = True,
+        convert_floating: bool = True,
     ):
         return self._default_to_pandas(
             "convert_dtypes",
@@ -2052,7 +2054,20 @@ class BasePandasDataset(object):
             obj.set_axis(labels, axis=axis, inplace=True)
             return obj
 
-    def shift(self, periods=1, freq=None, axis=0, fill_value=None):
+    def set_flags(
+        self, *, copy: bool = False, allows_duplicate_labels: Optional[bool] = None
+    ):
+        return self._default_to_pandas(
+            pandas.DataFrame.set_flags,
+            copy=copy,
+            allows_duplicate_labels=allows_duplicate_labels,
+        )
+
+    @property
+    def flags(self):
+        return self._default_to_pandas(pandas.DataFrame.flags)
+
+    def shift(self, periods=1, freq=None, axis=0, fill_value=no_default):
         if periods == 0:
             # Check obvious case first
             return self.copy()
@@ -2254,6 +2269,7 @@ class BasePandasDataset(object):
         escapechar=None,
         decimal=".",
         errors: str = "strict",
+        storage_options: StorageOptions = None,
     ):  # pragma: no cover
 
         kwargs = {
@@ -2277,6 +2293,7 @@ class BasePandasDataset(object):
             "escapechar": escapechar,
             "decimal": decimal,
             "errors": errors,
+            "storage_options": storage_options,
         }
         return self._default_to_pandas("to_csv", **kwargs)
 
@@ -2301,25 +2318,27 @@ class BasePandasDataset(object):
         inf_rep="inf",
         verbose=True,
         freeze_panes=None,
+        storage_options: StorageOptions = None,
     ):  # pragma: no cover
         return self._default_to_pandas(
             "to_excel",
             excel_writer,
-            sheet_name,
-            na_rep,
-            float_format,
-            columns,
-            header,
-            index,
-            index_label,
-            startrow,
-            startcol,
-            engine,
-            merge_cells,
-            encoding,
-            inf_rep,
-            verbose,
-            freeze_panes,
+            sheet_name=sheet_name,
+            na_rep=na_rep,
+            float_format=float_format,
+            columns=columns,
+            header=header,
+            index=index,
+            index_label=index_label,
+            startrow=startrow,
+            startcol=startcol,
+            engine=engine,
+            merge_cells=merge_cells,
+            encoding=encoding,
+            inf_rep=inf_rep,
+            verbose=verbose,
+            freeze_panes=freeze_panes,
+            storage_options=storage_options,
         )
 
     def to_hdf(self, path_or_buf, key, format="table", **kwargs):  # pragma: no cover
@@ -2340,6 +2359,7 @@ class BasePandasDataset(object):
         compression="infer",
         index=True,
         indent=None,
+        storage_options: StorageOptions = None,
     ):  # pragma: no cover
         return self._default_to_pandas(
             "to_json",
@@ -2354,6 +2374,7 @@ class BasePandasDataset(object):
             compression=compression,
             index=index,
             indent=indent,
+            storage_options=storage_options,
         )
 
     def to_latex(
@@ -2379,6 +2400,7 @@ class BasePandasDataset(object):
         multirow=None,
         caption=None,
         label=None,
+        position=None,
     ):  # pragma: no cover
         return self._default_to_pandas(
             "to_latex",
@@ -2405,9 +2427,21 @@ class BasePandasDataset(object):
             label=None,
         )
 
-    def to_markdown(self, buf=None, mode=None, index: bool = True, **kwargs):
+    def to_markdown(
+        self,
+        buf=None,
+        mode: str = "wt",
+        index: bool = True,
+        storage_options: StorageOptions = None,
+        **kwargs,
+    ):
         return self._default_to_pandas(
-            "to_markdown", buf=buf, mode=mode, index=index, **kwargs
+            "to_markdown",
+            buf=buf,
+            mode=mode,
+            index=index,
+            storage_options=storage_options,
+            **kwargs,
         )
 
     def to_numpy(self, dtype=None, copy=False, na_value=no_default):
@@ -2422,10 +2456,18 @@ class BasePandasDataset(object):
         return self._default_to_pandas("to_period", freq=freq, axis=axis, copy=copy)
 
     def to_pickle(
-        self, path, compression="infer", protocol=pkl.HIGHEST_PROTOCOL
+        self,
+        path,
+        compression="infer",
+        protocol=pkl.HIGHEST_PROTOCOL,
+        storage_options: StorageOptions = None,
     ):  # pragma: no cover
         return self._default_to_pandas(
-            "to_pickle", path, compression=compression, protocol=protocol
+            "to_pickle",
+            path,
+            compression=compression,
+            protocol=protocol,
+            storage_options=storage_options,
         )
 
     def to_string(

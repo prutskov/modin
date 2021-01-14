@@ -34,13 +34,13 @@ from pandas.core.indexes.api import ensure_index_from_sequences
 from pandas.util._validators import validate_bool_kwarg
 from pandas.io.formats.printing import pprint_thing
 from pandas._libs.lib import no_default
-from pandas._typing import Label
+from pandas._typing import Label, StorageOptions
 
 import itertools
 import functools
 import numpy as np
 import sys
-from typing import Optional, Sequence, Tuple, Union, Mapping
+from typing import IO, Optional, Sequence, Tuple, Union, Mapping
 import warnings
 
 from modin.error_message import ErrorMessage
@@ -281,7 +281,7 @@ class DataFrame(BasePandasDataset):
     def add_suffix(self, suffix):
         return DataFrame(query_compiler=self._query_compiler.add_suffix(suffix))
 
-    def applymap(self, func):
+    def applymap(self, func, na_action: Optional[str] = None):
         if not callable(func):
             raise ValueError("'{0}' object is not callable".format(type(func)))
         ErrorMessage.non_verified_udf()
@@ -786,7 +786,13 @@ class DataFrame(BasePandasDataset):
         )
 
     def info(
-        self, verbose=None, buf=None, max_cols=None, memory_usage=None, null_counts=None
+        self,
+        verbose: Optional[bool] = None,
+        buf: Optional[IO[str]] = None,
+        max_cols: Optional[int] = None,
+        memory_usage: Optional[Union[bool, str]] = None,
+        show_counts: Optional[bool] = None,
+        null_counts: Optional[bool] = None,
     ):
         def put_str(src, output_len=None, spaces=2):
             src = str(src)
@@ -1784,11 +1790,12 @@ class DataFrame(BasePandasDataset):
 
     def to_parquet(
         self,
-        path,
+        path=None,
         engine="auto",
         compression="snappy",
         index=None,
         partition_cols=None,
+        storage_options: StorageOptions = None,
         **kwargs,
     ):  # pragma: no cover
         return self._default_to_pandas(
@@ -1798,6 +1805,7 @@ class DataFrame(BasePandasDataset):
             compression=compression,
             index=index,
             partition_cols=partition_cols,
+            storage_options=storage_options,
             **kwargs,
         )
 
@@ -1824,6 +1832,7 @@ class DataFrame(BasePandasDataset):
         version=114,
         convert_strl=None,
         compression: Union[str, Mapping[str, str], None] = "infer",
+        storage_options: StorageOptions = None,
     ):  # pragma: no cover
         return self._default_to_pandas(
             pandas.DataFrame.to_stata,
@@ -1837,6 +1846,7 @@ class DataFrame(BasePandasDataset):
             version=version,
             convert_strl=convert_strl,
             compression=compression,
+            storage_options=storage_options,
         )
 
     def to_timestamp(self, freq=None, how="start", axis=0, copy=True):
