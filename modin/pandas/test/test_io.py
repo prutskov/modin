@@ -1523,7 +1523,7 @@ class TestExcel:
                 modin_warning=UserWarning,
                 # read_excel kwargs
                 io=unique_filename,
-                engine="xlrd",
+                engine="openpyxl",
             )
         finally:
             teardown_test_files([unique_filename])
