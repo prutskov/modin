@@ -40,7 +40,7 @@ jobs:
     env:
       MODIN_MEMORY: 1000000000
       MODIN_TEST_DATASET_SIZE: "small"
-    name: Test ${{ matrix.backend }} backend, Python 3.8
+    name: Test ${{ matrix.backend }} backend, Python 3.7
     steps:
       - uses: actions/checkout@v2
         with:
