@@ -58,23 +58,17 @@ internal implementation is the following:
    ..
 
 2. On this step, the parameter `num_actors` is processed. The internal function :py:func:`~modin.experimental.xgboost.xgboost_ray._get_num_actors`
-   examines the value provided by the user and checks if it fits in the set of expected values
-   (int, "default_train", "default_predict").
+   examines the value provided by the user and checks if it fits in the set of expected values (int, None).
 
-   * int - `num_actors` won't be changed. This value will be used.
-   * "default_train" - `num_actors` will be computed using condition that 1 actor should use maximum 2 CPUs.
-     This condition was chosen for using maximum parallel workers with multithreaded XGBoost training (2 threads
-     per worker will be used in this case).
-   * "default_predict" - `num_actors` will be computed using condition that 1 actor should use maximum 8 CPUs.
+   * int - `num_actors` won't be changed. This value will be used, if it is multiple to a number of nodes in Ray cluster.
+   * None - `num_actors` will be computed using condition that 1 actor should use maximum 8 CPUs.
      This condition was chosen to combine parallelization techniques: parallel actors and parallel threads.
 
 .. note:: `num_actors` parameter is made available for public functions :py:func:`~modin.experimental.xgboost.train` and ``predict``
   method of :py:class:`~modin.experimental.xgboost.Booster` class to allow fine-tuning for obtaining the best
   performance in specific use cases.
 
-3. ``ray.util.placement_group`` is created to reserve all available Ray resources. After that
-   :py:class:`~modin.experimental.xgboost.xgboost_ray.ModinXGBoostActor` objects are created using resources of the
-   previously created placement group.
+3. :py:class:`~modin.experimental.xgboost.xgboost_ray.ModinXGBoostActor` objects are created evenly between Ray's cluster nodes.
 
 4. Data (`dtrain` for :py:func:`~modin.experimental.xgboost.xgboost_ray._train`, `data` for
    :py:func:`~modin.experimental.xgboost.xgboost_ray._predict`) is split between actors evenly. The internal function
@@ -86,26 +80,24 @@ internal implementation is the following:
 .. note:: :py:func:`~modin.experimental.xgboost.xgboost_ray._assign_row_partitions_to_actors` takes into account IP
   addresses of row partitions of `dtrain` data to minimize excess data transfer.
 
-1. For each :py:class:`~modin.experimental.xgboost.xgboost_ray.ModinXGBoostActor` the object methods ``set_train_data`` or ``set_predict_data`` are
+5. For each :py:class:`~modin.experimental.xgboost.xgboost_ray.ModinXGBoostActor` the object methods ``set_train_data`` or ``set_predict_data`` are
    called remotely. Those methods run by loading row partitions in actor according to the dictionary with partitions
    distribution from previous step. When data is passed to the actor, the row partitions are automatically materialized
    (``ray.ObjectRef`` -> ``pandas.DataFrame``).
 
-2. Methods ``train`` or ``predict`` of :py:class:`~modin.experimental.xgboost.xgboost_ray.ModinXGBoostActor` class object are called remotely.
+6. Methods ``train`` or ``predict`` of :py:class:`~modin.experimental.xgboost.xgboost_ray.ModinXGBoostActor` class object are called remotely.
 
    * ``train``: method runs XGBoost training on local data of actor, connects to ``Rabit Tracker`` for sharing
      training state between actors and returns dictionary with `booster` and `evaluation results`.
    * ``predict``: method runs XGBoost prediction on local data of actor and returns IP address of actor and partial
      prediction (``pandas.DataFrame``).
 
-3. On the final stage results from actors are returned.
+7. On the final stage results from actors are returned.
 
-   * ``train``: `booster` and `evals_result` is returned using ``ray.get`` function from remote actor. Placement
-     group which was created on the step 3 is removed to free resources. :py:class:`~modin.experimental.xgboost.Booster`
+   * ``train``: `booster` and `evals_result` is returned using ``ray.get`` function from remote actor. :py:class:`~modin.experimental.xgboost.Booster`
      object is created and returned to user. 
-   * ``predict``: using ``ray.wait`` function we wait until all actors finish computing local predictions. Placement group
-     which was created on the step 3 is removed to free resources. ``modin.pandas.DataFrame`` is created from
-     ``ray.ObjectRef`` objects which is returned from actors. Modin DataFrame is returned to user.
+   * ``predict``: ``modin.pandas.DataFrame`` is created from ``ray.ObjectRef`` objects which is returned
+     from actors. Modin DataFrame is returned to user.
 
 
 Internal API

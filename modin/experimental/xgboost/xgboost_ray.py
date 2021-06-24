@@ -27,7 +27,6 @@ from collections import defaultdict
 import xgboost as xgb
 import ray
 from ray.services import get_node_ip_address
-from ray.util.placement_group import placement_group, remove_placement_group
 import pandas
 
 from modin.distributed.dataframe.pandas import from_partitions
@@ -249,11 +248,10 @@ def _get_min_cpus_per_node():
     int
         Min number of CPUs per node.
     """
-    # TODO: max_node_cpus -> min_node_cpus
-    max_node_cpus = min(
+    min_node_cpus = min(
         node.get("Resources", {}).get("CPU", 0.0) for node in ray.nodes()
     )
-    return max_node_cpus if max_node_cpus > 0.0 else _get_cluster_cpus()
+    return min_node_cpus if min_node_cpus > 0.0 else _get_cluster_cpus()
 
 
 def _get_cpus_per_actor(num_actors):
@@ -279,62 +277,30 @@ def _get_cpus_per_actor(num_actors):
 
 def _get_num_actors(num_actors):
     """
-    Get number on actors to create.
-
-    In case `num_actors` is 'default_train' string,
-    integer number of actors will be computed  by condition
-    2 CPUs per 1 actor, in case 'default_predict' 8 CPUs per 1 actor.
+    Get number of actors to create.
 
     Parameters
     ----------
-    num_actors : int or {'default_train', 'default_predict'}
-        Number of actors to create or str to set defaults.
+    num_actors : int or None
+        Number of actors to create. In case this is None, integer
+        number of actors will be computed  by condition 8 CPUs per 1 actor.
 
     Returns
     -------
     int
         Number of actors to create.
     """
-    min_cpus_per_node = _get_min_cpus_per_node()
-    if num_actors == "default_train":
-        num_actors_per_node = max(1, int(min_cpus_per_node // 2))
-        return num_actors_per_node * len(ray.nodes())
-    elif num_actors == "default_predict":
-        num_actors_per_node = max(1, int(min_cpus_per_node // 8))
-        return num_actors_per_node * len(ray.nodes())
+    if num_actors is None:
+        min_cpus_per_node = _get_min_cpus_per_node()
+        return max(1, int(min_cpus_per_node // 8)) * len(ray.nodes())
     elif isinstance(num_actors, int):
+        if num_actors % len(ray.nodes()) != 0:
+            raise RuntimeError(
+                "`num_actors` must be a multiple to number of nodes in Ray cluster."
+            )
         return num_actors
     else:
-        RuntimeError("`num_actors` must be int or None")
-
-
-def _create_placement_group(num_cpus_per_actor, num_actors):
-    """
-    Create Ray placement group to grab resources.
-
-    Parameters
-    ----------
-    num_cpus_per_actor : int
-        Number of CPUs per actor.
-    num_actors : int
-        Number of actors.
-
-    Returns
-    -------
-    ray.util.PlacementGroup
-        Placement group with grabbed resources.
-    """
-    cpu_bundle = {"CPU": num_cpus_per_actor}
-    bundles = [cpu_bundle for _ in range(num_actors)]
-
-    pg = placement_group(bundles, strategy="SPREAD")
-
-    ready, _ = ray.wait([pg.ready()], timeout=100)
-
-    if ready is None:
-        raise TimeoutError("Placement group creation timeout.")
-
-    return pg
+        raise RuntimeError("`num_actors` must be int or `None")
 
 
 def create_actors(num_actors):
@@ -352,14 +318,22 @@ def create_actors(num_actors):
         Pair of actors list and placement group of actors.
     """
     num_cpus_per_actor = _get_cpus_per_actor(num_actors)
-    pg = _create_placement_group(num_cpus_per_actor, num_actors)
-    actors = [
-        ModinXGBoostActor.options(
-            num_cpus=num_cpus_per_actor, placement_group=pg
-        ).remote(i, nthread=num_cpus_per_actor)
-        for i in range(num_actors)
+    nodes_ips = [
+        key for key, _ in ray.cluster_resources().items() if key.startswith("node:")
     ]
-    return actors, pg
+    num_actors_per_node = num_actors // len(nodes_ips)
+    actors_ips = [ip for ip in nodes_ips for _ in range(num_actors_per_node)]
+
+    actors = [
+        (
+            node_ip.split("node:")[-1],
+            ModinXGBoostActor.options(resources={node_ip: 0.01}).remote(
+                i, nthread=num_cpus_per_actor
+            ),
+        )
+        for i, node_ip in enumerate(actors_ips)
+    ]
+    return actors
 
 
 def _split_data_across_actors(
@@ -394,7 +368,7 @@ def _split_data_across_actors(
             data_for_aligning=X_parts_by_actors,
         )
 
-    for rank, actor in enumerate(actors):
+    for rank, (_, actor) in enumerate(actors):
         X_parts = X_parts_by_actors[rank] if is_predict else X_parts_by_actors[rank][0]
         if y_parts is None:
             set_func(actor, *X_parts)
@@ -445,10 +419,7 @@ def _assign_row_partitions_to_actors(
 
             # Group actors which are one the same ip
             actor_ips = defaultdict(list)
-
-            for rank, ip in enumerate(
-                ray.get([actor.get_ip.remote() for actor in actors])
-            ):
+            for rank, (ip, _) in enumerate(actors):
                 actor_ips[ip].append(rank)
 
             # Get distribution of parts between nodes ({ip:[(part, position),..],..})
@@ -616,14 +587,12 @@ def _train(
 
     assert len(X_row_parts) == len(y_row_parts), "Unaligned train data"
 
-    num_actors = _get_num_actors(
-        num_actors if isinstance(num_actors, int) else "default_train"
-    )
+    num_actors = _get_num_actors(num_actors)
 
     if num_actors > len(X_row_parts):
         num_actors = len(X_row_parts)
 
-    actors, pg = create_actors(num_actors)
+    actors = create_actors(num_actors)
 
     add_as_eval_method = None
     if evals:
@@ -660,12 +629,12 @@ def _train(
 
         # Train
         fut = [
-            actor.train.remote(rabit_args, params, *args, **kwargs) for actor in actors
+            actor.train.remote(rabit_args, params, *args, **kwargs)
+            for _, actor in actors
         ]
         # All results should be the same because of Rabit tracking. So we just
         # return the first one.
         result = ray.get(fut[0])
-        remove_placement_group(pg)
         LOGGER.info(f"Training time: {time.time() - s} s")
         return result
 
@@ -704,15 +673,13 @@ def _predict(
 
     X_row_parts, _ = data
 
-    num_actors = _get_num_actors(
-        num_actors if isinstance(num_actors, int) else "default_predict"
-    )
+    num_actors = _get_num_actors(num_actors)
 
     if num_actors > len(X_row_parts):
         num_actors = len(X_row_parts)
 
     # Create remote actors
-    actors, pg = create_actors(num_actors)
+    actors = create_actors(num_actors)
 
     # Split data across workers
     _split_data_across_actors(
@@ -729,11 +696,8 @@ def _predict(
 
     predictions = [
         tuple(actor.predict.options(num_returns=2).remote(booster, **kwargs))
-        for actor in actors
+        for _, actor in actors
     ]
-
-    ray.wait([part for _, part in predictions], num_returns=len(predictions))
-    remove_placement_group(pg)
 
     result = from_partitions(predictions, 0)
     LOGGER.info(f"Prediction time: {time.time() - s} s")
