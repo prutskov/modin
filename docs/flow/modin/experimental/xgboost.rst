@@ -27,15 +27,13 @@ row partitions using the function :py:func:`~modin.distributed.dataframe.pandas.
   :members:
 
 :py:class:`~modin.experimental.xgboost.Booster` inherits original class ``xgboost.Booster`` and
-overrides method ``predict``. The main differences from original class interface for ``predict``
-method are: (1) changing the type of the `data` parameter to :py:class:`~modin.experimental.xgboost.DMatrix`, and (2)
-a new parameter `num_actors`, which specifies the number of actors to run for prediction.
+overrides method ``predict``. The difference from original class interface for ``predict``
+method is changing the type of the `data` parameter to :py:class:`~modin.experimental.xgboost.DMatrix`.
 
 .. autoclass:: modin.experimental.xgboost.Booster
     :members:
 
-:py:func:`~modin.experimental.xgboost.train` function (similar to ``predict`` method of
-:py:class:`~modin.experimental.xgboost.Booster`) has 2 differences from the original ``train`` function - (1) the
+:py:func:`~modin.experimental.xgboost.train` function has 2 differences from the original ``train`` function - (1) the
 data type of `dtrain` parameter is :py:class:`~modin.experimental.xgboost.DMatrix` and (2) a new parameter `num_actors`.
 
 .. autofunction:: modin.experimental.xgboost.train

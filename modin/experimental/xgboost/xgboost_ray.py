@@ -24,6 +24,7 @@ from typing import Dict, List
 import math
 from collections import defaultdict
 
+import numpy as np
 import xgboost as xgb
 import ray
 from ray.services import get_node_ip_address
@@ -38,7 +39,7 @@ LOGGER = logging.getLogger("[modin.xgboost]")
 @ray.remote
 class ModinXGBoostActor:
     """
-    Ray actor-class runs training/prediction on remote workers.
+    Ray actor-class runs training on remote workers.
 
     Parameters
     ----------
@@ -87,17 +88,6 @@ class ModinXGBoostActor:
 
         return xgb.DMatrix(X, y, nthread=self._nthreads)
 
-    def get_ip(self):
-        """
-        Get IP address of actor.
-
-        Returns
-        -------
-        str
-            An IP address of node used by actor.
-        """
-        return get_node_ip_address()
-
     def set_train_data(self, *X_y, add_as_eval_method=None):
         """
         Set train data for actor.
@@ -115,25 +105,6 @@ class ModinXGBoostActor:
 
         if add_as_eval_method is not None:
             self._evals.append((self._dtrain, add_as_eval_method))
-
-    def set_predict_data(
-        self,
-        *X,
-    ):
-        """
-        Set prediction data for actor.
-
-        Parameters
-        ----------
-        *X : iterable
-            Sequence of ray.ObjectRef objects. When it is passed in actor, auto-materialization
-            of ray.ObjectRef -> pandas.DataFrame happens.
-        """
-        X = pandas.concat(X, axis=0)
-        self._dpredict = {
-            "dmatrix": xgb.DMatrix(X, nthread=self._nthreads),
-            "index": X.index,
-        }
 
     def add_eval_data(self, *X_y, eval_method):
         """
@@ -195,36 +166,6 @@ class ModinXGBoostActor:
             )
             LOGGER.info(f"Local training time: {time.time() - s} s")
             return {"booster": bst, "history": evals_result}
-
-    def predict(self, booster: xgb.Booster, **kwargs):
-        """
-        Run local XGBoost prediction.
-
-        Parameters
-        ----------
-        booster : xgboost.Booster
-            A trained booster.
-        **kwargs : dict
-            Other parameters for `xgboost.Booster.predict`.
-
-        Returns
-        -------
-        tuple
-            Pair of IP address of caller and pandas.DataFrame
-            with partial prediction result.
-        """
-        local_dpredict = self._dpredict
-        booster.set_param({"nthread": self._nthreads})
-
-        s = time.time()
-
-        predictions = pandas.DataFrame(
-            booster.predict(local_dpredict["dmatrix"], **kwargs),
-            index=local_dpredict["index"],
-        )
-        LOGGER.info(f"Local prediction time: {time.time() - s} s")
-
-        return get_node_ip_address(), predictions
 
 
 def _get_cluster_cpus():
@@ -337,7 +278,10 @@ def create_actors(num_actors):
 
 
 def _split_data_across_actors(
-    actors: List, set_func, X_parts, y_parts=None, is_predict=False
+    actors: List,
+    set_func,
+    X_parts,
+    y_parts,
 ):
     """
     Split row partitions of data between actors.
@@ -350,49 +294,37 @@ def _split_data_across_actors(
         The function for setting data in actor.
     X_parts : list
         Row partitions of X data.
-    y_parts : list, optional
+    y_parts : list
         Row partitions of y data.
-    is_predict : bool, default: False
-        Is split data for predict or not.
     """
     X_parts_by_actors = _assign_row_partitions_to_actors(
         actors,
         X_parts,
-        is_predict=is_predict,
     )
 
-    if y_parts is not None:
-        y_parts_by_actors = _assign_row_partitions_to_actors(
-            actors,
-            y_parts,
-            data_for_aligning=X_parts_by_actors,
-        )
+    y_parts_by_actors = _assign_row_partitions_to_actors(
+        actors,
+        y_parts,
+        data_for_aligning=X_parts_by_actors,
+    )
 
     for rank, (_, actor) in enumerate(actors):
-        X_parts = X_parts_by_actors[rank] if is_predict else X_parts_by_actors[rank][0]
-        if y_parts is None:
-            set_func(actor, *X_parts)
-        else:
-            y_parts = y_parts_by_actors[rank][0]
-            set_func(actor, *(X_parts + y_parts))
+        X_parts = X_parts_by_actors[rank][0]
+        y_parts = y_parts_by_actors[rank][0]
+        set_func(actor, *(X_parts + y_parts))
 
 
 def _assign_row_partitions_to_actors(
     actors: List,
     row_partitions,
     data_for_aligning=None,
-    is_predict=False,
 ):
     """
     Assign row_partitions to actors.
 
-    In case of `is_predict` == False, `row_partitions` will be
-    assigned to actors according to their IPs. If distribution isn't
-    even, partitions will be moved from actor with excess partitions
-    to actor with lack of them.
-
-    In case of `is_predict` == True, `row_partitions` will be
-    assigned evenly to actors in order.
+    `row_partitions` will be assigned to actors according to their IPs.
+    If distribution isn't even, partitions will be moved from actor
+    with excess partitions to actor with lack of them.
 
     Parameters
     ----------
@@ -403,8 +335,6 @@ def _assign_row_partitions_to_actors(
     data_for_aligning : dict, optional
         Data according to the order of which should be
         distributed `row_partitions`. Used to align y with X.
-    is_predict : bool, default: False
-        Is split data for predict or not.
 
     Returns
     -------
@@ -413,129 +343,106 @@ def _assign_row_partitions_to_actors(
         as {actor_rank: (partitions, order)}.
     """
     num_actors = len(actors)
-    if not is_predict:
-        if data_for_aligning is None:
-            parts_ips_ref, parts_ref = zip(*row_partitions)
+    if data_for_aligning is None:
+        parts_ips_ref, parts_ref = zip(*row_partitions)
 
-            # Group actors which are one the same ip
-            actor_ips = defaultdict(list)
-            for rank, (ip, _) in enumerate(actors):
-                actor_ips[ip].append(rank)
+        # Group actors which are one the same ip
+        actor_ips = defaultdict(list)
+        for rank, (ip, _) in enumerate(actors):
+            actor_ips[ip].append(rank)
 
-            # Get distribution of parts between nodes ({ip:[(part, position),..],..})
-            init_parts_distribution = defaultdict(list)
-            for idx, (ip, part_ref) in enumerate(
-                zip(ray.get(list(parts_ips_ref)), parts_ref)
-            ):
-                init_parts_distribution[ip].append((part_ref, idx))
-
-            num_parts = len(parts_ref)
-            min_parts_per_actor = math.floor(num_parts / num_actors)
-            max_parts_per_actor = math.ceil(num_parts / num_actors)
-            num_actors_with_max_parts = num_parts % num_actors
-
-            row_partitions_by_actors = defaultdict(list)
-            # Fill actors without movement parts between ips
-            for actor_ip, ranks in actor_ips.items():
-                # Loop across actors which are placed on actor_ip
-                for rank in ranks:
-                    num_parts_on_ip = len(init_parts_distribution[actor_ip])
-
-                    # Check that have something to distribute on this ip
-                    if num_parts_on_ip == 0:
-                        break
-                    # Check that node with `actor_ip` has enough parts for minimal
-                    # filling actor with `rank`
-                    if num_parts_on_ip >= min_parts_per_actor:
-                        # Check that node has enough parts for max filling
-                        # actor with `rank`
-                        if (
-                            num_parts_on_ip >= max_parts_per_actor
-                            and num_actors_with_max_parts > 0
-                        ):
-                            pop_slice = slice(0, max_parts_per_actor)
-                            num_actors_with_max_parts -= 1
-                        else:
-                            pop_slice = slice(0, min_parts_per_actor)
-
-                        row_partitions_by_actors[rank].extend(
-                            init_parts_distribution[actor_ip][pop_slice]
-                        )
-                        # Delete parts which we already assign
-                        del init_parts_distribution[actor_ip][pop_slice]
-                    else:
-                        row_partitions_by_actors[rank].extend(
-                            init_parts_distribution[actor_ip]
-                        )
-                        init_parts_distribution[actor_ip] = []
-
-            # Remove empty IPs
-            for ip in list(init_parts_distribution):
-                if len(init_parts_distribution[ip]) == 0:
-                    init_parts_distribution.pop(ip)
-
-            # IP's aren't necessary now
-            init_parts_distribution = [
-                pair for pairs in init_parts_distribution.values() for pair in pairs
-            ]
-
-            # Fill the actors with extra parts (movements data between nodes)
-            for rank in range(len(actors)):
-                num_parts_on_rank = len(row_partitions_by_actors[rank])
-
-                if num_parts_on_rank == max_parts_per_actor or (
-                    num_parts_on_rank == min_parts_per_actor
-                    and num_actors_with_max_parts == 0
-                ):
-                    continue
-
-                if num_actors_with_max_parts > 0:
-                    pop_slice = slice(0, max_parts_per_actor - num_parts_on_rank)
-                    num_actors_with_max_parts -= 1
-                else:
-                    pop_slice = slice(0, min_parts_per_actor - num_parts_on_rank)
-
-                row_partitions_by_actors[rank].extend(
-                    init_parts_distribution[pop_slice]
-                )
-                del init_parts_distribution[pop_slice]
-
-            if len(init_parts_distribution) != 0:
-                raise RuntimeError(
-                    f"Not all partitions were ditributed between actors: {len(init_parts_distribution)} left."
-                )
-
-            row_parts_by_ranks = dict()
-            for rank, pairs_part_pos in dict(row_partitions_by_actors).items():
-                parts, order = zip(*pairs_part_pos)
-                row_parts_by_ranks[rank] = (list(parts), list(order))
-        else:
-            row_parts_by_ranks = {rank: ([], []) for rank in range(len(actors))}
-
-            for rank, (_, order_of_indexes) in data_for_aligning.items():
-                row_parts_by_ranks[rank][1].extend(order_of_indexes)
-                for row_idx in order_of_indexes:
-                    row_parts_by_ranks[rank][0].append(row_partitions[row_idx])
-    else:
-        row_parts_by_ranks = defaultdict(list)
-        _, parts_ref = zip(*row_partitions)
+        # Get distribution of parts between nodes ({ip:[(part, position),..],..})
+        init_parts_distribution = defaultdict(list)
+        for idx, (ip, part_ref) in enumerate(
+            zip(ray.get(list(parts_ips_ref)), parts_ref)
+        ):
+            init_parts_distribution[ip].append((part_ref, idx))
 
         num_parts = len(parts_ref)
         min_parts_per_actor = math.floor(num_parts / num_actors)
         max_parts_per_actor = math.ceil(num_parts / num_actors)
         num_actors_with_max_parts = num_parts % num_actors
 
-        start_idx = 0
-        for rank, actor in enumerate(actors):
+        row_partitions_by_actors = defaultdict(list)
+        # Fill actors without movement parts between ips
+        for actor_ip, ranks in actor_ips.items():
+            # Loop across actors which are placed on actor_ip
+            for rank in ranks:
+                num_parts_on_ip = len(init_parts_distribution[actor_ip])
+
+                # Check that have something to distribute on this ip
+                if num_parts_on_ip == 0:
+                    break
+                # Check that node with `actor_ip` has enough parts for minimal
+                # filling actor with `rank`
+                if num_parts_on_ip >= min_parts_per_actor:
+                    # Check that node has enough parts for max filling
+                    # actor with `rank`
+                    if (
+                        num_parts_on_ip >= max_parts_per_actor
+                        and num_actors_with_max_parts > 0
+                    ):
+                        pop_slice = slice(0, max_parts_per_actor)
+                        num_actors_with_max_parts -= 1
+                    else:
+                        pop_slice = slice(0, min_parts_per_actor)
+
+                    row_partitions_by_actors[rank].extend(
+                        init_parts_distribution[actor_ip][pop_slice]
+                    )
+                    # Delete parts which we already assign
+                    del init_parts_distribution[actor_ip][pop_slice]
+                else:
+                    row_partitions_by_actors[rank].extend(
+                        init_parts_distribution[actor_ip]
+                    )
+                    init_parts_distribution[actor_ip] = []
+
+        # Remove empty IPs
+        for ip in list(init_parts_distribution):
+            if len(init_parts_distribution[ip]) == 0:
+                init_parts_distribution.pop(ip)
+
+        # IP's aren't necessary now
+        init_parts_distribution = [
+            pair for pairs in init_parts_distribution.values() for pair in pairs
+        ]
+
+        # Fill the actors with extra parts (movements data between nodes)
+        for rank in range(len(actors)):
+            num_parts_on_rank = len(row_partitions_by_actors[rank])
+
+            if num_parts_on_rank == max_parts_per_actor or (
+                num_parts_on_rank == min_parts_per_actor
+                and num_actors_with_max_parts == 0
+            ):
+                continue
+
             if num_actors_with_max_parts > 0:
-                num_actor_parts = max_parts_per_actor
+                pop_slice = slice(0, max_parts_per_actor - num_parts_on_rank)
                 num_actors_with_max_parts -= 1
             else:
-                num_actor_parts = min_parts_per_actor
+                pop_slice = slice(0, min_parts_per_actor - num_parts_on_rank)
 
-            idx_slice = slice(start_idx, start_idx + num_actor_parts)
-            row_parts_by_ranks[rank].extend(parts_ref[idx_slice])
-            start_idx += num_actor_parts
+            row_partitions_by_actors[rank].extend(init_parts_distribution[pop_slice])
+            del init_parts_distribution[pop_slice]
+
+        if len(init_parts_distribution) != 0:
+            raise RuntimeError(
+                f"Not all partitions were ditributed between actors: {len(init_parts_distribution)} left."
+            )
+
+        row_parts_by_ranks = dict()
+        for rank, pairs_part_pos in dict(row_partitions_by_actors).items():
+            parts, order = zip(*pairs_part_pos)
+            row_parts_by_ranks[rank] = (list(parts), list(order))
+    else:
+        row_parts_by_ranks = {rank: ([], []) for rank in range(len(actors))}
+
+        for rank, (_, order_of_indexes) in data_for_aligning.items():
+            row_parts_by_ranks[rank][1].extend(order_of_indexes)
+            for row_idx in order_of_indexes:
+                row_parts_by_ranks[rank][0].append(row_partitions[row_idx])
 
     return row_parts_by_ranks
 
@@ -583,7 +490,7 @@ def _train(
     """
     s = time.time()
 
-    X_row_parts, y_row_parts = dtrain
+    X_row_parts, y_row_parts = dtrain.data, dtrain.label
 
     assert len(X_row_parts) == len(y_row_parts), "Unaligned train data"
 
@@ -601,15 +508,15 @@ def _train(
                 add_as_eval_method = method
                 evals.remove((eval_data, method))
 
-        for ((eval_X, eval_y), eval_method) in evals:
+        for (eval_dmatrix, eval_method) in evals:
             # Split data across workers
             _split_data_across_actors(
                 actors,
                 lambda actor, *X_y: actor.add_eval_data.remote(
                     *X_y, eval_method=eval_method
                 ),
-                eval_X,
-                y_parts=eval_y,
+                eval_dmatrix.data,
+                eval_dmatrix.label,
             )
 
     # Split data across workers
@@ -619,7 +526,7 @@ def _train(
             *X_y, add_as_eval_method=add_as_eval_method
         ),
         X_row_parts,
-        y_parts=y_row_parts,
+        y_row_parts,
     )
     LOGGER.info(f"Data preparation time: {time.time() - s} s")
 
@@ -639,18 +546,41 @@ def _train(
         return result
 
 
+@ray.remote
+def _worker_predict(booster, part, columns, **kwargs):
+    """
+    Run prediction on remote worker.
+
+    Parameters
+    ----------
+    booster : xgboost.Booster or ray.ObjectRef
+        A trained booster.
+    part : pandas.DataFrame of ray.ObjectRef
+        Partition of full data used for local prediction.
+    columns : list or ray.ObjectRef
+        Columns for the result.
+    **kwargs : dict
+        Other parameters are the same as `xgboost.Booster.predict`.
+    """
+    dmatrix = xgb.DMatrix(part)
+    prediction = pandas.DataFrame(
+        booster.predict(dmatrix, **kwargs),
+        index=part.index,
+        columns=columns,
+    )
+    return prediction
+
+
 def _predict(
     booster,
     data,
-    num_actors,
     **kwargs,
 ):
     """
     Run distributed prediction with a trained booster on Ray backend.
 
-    During work it evenly distributes `data` between workers,
-    runs xgb.predict on each worker for subset of `data` and creates
-    Modin DataFrame with prediction results.
+    During work it runs xgb.predict on each worker for row partition of `data`
+    and creates Modin DataFrame with prediction results.
 
     Parameters
     ----------
@@ -658,10 +588,7 @@ def _predict(
         A trained booster.
     data : modin.experimental.xgboost.DMatrix
         Input data used for prediction.
-    num_actors : int, optional
-        Number of actors for prediction. If unspecified, this value will be
-        computed automatically.
-    **kwargs : dist
+    **kwargs : dict
         Other parameters are the same as `xgboost.Booster.predict`.
 
     Returns
@@ -671,35 +598,39 @@ def _predict(
     """
     s = time.time()
 
-    X_row_parts, _ = data
+    # Get metainfo from dmatrix
+    input_index, input_columns, row_lengths = data.data_metainfo
 
-    num_actors = _get_num_actors(num_actors)
+    # Infer columns of result
+    def _get_num_columns(booster, n_features, **kwargs):
+        rng = np.random.RandomState(777)
+        test_data = rng.randn(1, n_features)
+        test_predictions = booster.predict(
+            xgb.DMatrix(test_data), validate_features=False, **kwargs
+        )
+        num_columns = (
+            test_predictions.shape[1] if len(test_predictions.shape) > 1 else 1
+        )
+        return num_columns
 
-    if num_actors > len(X_row_parts):
-        num_actors = len(X_row_parts)
+    result_num_columns = _get_num_columns(booster, len(input_columns), **kwargs)
+    new_columns = list(range(result_num_columns))
 
-    # Create remote actors
-    actors = create_actors(num_actors)
-
-    # Split data across workers
-    _split_data_across_actors(
-        actors,
-        lambda actor, *X: actor.set_predict_data.remote(*X),
-        X_row_parts,
-        is_predict=True,
-    )
-
-    LOGGER.info(f"Data preparation time: {time.time() - s} s")
-    s = time.time()
-
+    # Put common data in object store
     booster = ray.put(booster)
+    new_columns_ref = ray.put(new_columns)
 
-    predictions = [
-        tuple(actor.predict.options(num_returns=2).remote(booster, **kwargs))
-        for _, actor in actors
+    prediction_refs = [
+        _worker_predict.remote(booster, part, new_columns_ref, **kwargs)
+        for _, part in data.data
     ]
-
-    result = from_partitions(predictions, 0)
+    predictions = from_partitions(
+        prediction_refs,
+        0,
+        index=input_index,
+        columns=new_columns,
+        row_lengths=row_lengths,
+        column_widths=[len(new_columns)],
+    )
     LOGGER.info(f"Prediction time: {time.time() - s} s")
-
-    return result
+    return predictions

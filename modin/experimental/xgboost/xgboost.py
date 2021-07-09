@@ -54,21 +54,11 @@ class DMatrix(xgb.DMatrix):
         self.data = unwrap_partitions(data, axis=0, get_ip=True)
         self.label = unwrap_partitions(label, axis=0)
 
-    def __iter__(self):
-        """
-        Return unwrapped `self.data` and `self.label`.
-
-        Yields
-        ------
-        list
-            List of `self.data` with pairs of references to IP of row partition
-            and row partition [(IP_ref0, partition_ref0), ..].
-        list
-            List of `self.label` with references to row partitions
-            [partition_ref0, ..].
-        """
-        yield self.data
-        yield self.label
+        self.data_metainfo = (
+            data.index,
+            data.columns,
+            data._query_compiler._modin_frame._row_lengths,
+        )
 
 
 class Booster(xgb.Booster):
@@ -94,23 +84,18 @@ class Booster(xgb.Booster):
     def predict(
         self,
         data: DMatrix,
-        num_actors: Optional[int] = None,
         **kwargs,
     ):
         """
         Run distributed prediction with a trained booster.
 
-        During work it evenly distributes `data` between workers,
-        runs xgb.predict on each worker for subset of `data` and creates
-        Modin DataFrame with prediction results.
+        During work it runs xgb.predict on each worker for row partition of `data`
+        and creates Modin DataFrame with prediction results.
 
         Parameters
         ----------
         data : modin.experimental.xgboost.DMatrix
             Input data used for prediction.
-        num_actors : int, optional
-            Number of actors for prediction. If unspecified, this value will be
-            computed automatically.
         **kwargs : dict
             Other parameters are the same as `xgboost.Booster.predict`.
 
@@ -126,11 +111,10 @@ class Booster(xgb.Booster):
         else:
             raise ValueError("Current version supports only Ray engine.")
 
-        assert isinstance(
-            data, DMatrix
-        ), f"Type of `data` is {type(data)}, but expected {DMatrix}."
+        if not isinstance(data, DMatrix):
+            raise TypeError(f"Type of `data` is {type(data)}, but expected {DMatrix}.")
 
-        result = _predict(self.copy(), data, num_actors, **kwargs)
+        result = _predict(self.copy(), data, **kwargs)
         LOGGER.info("Prediction finished")
 
         return result
@@ -185,9 +169,8 @@ def train(
     else:
         raise ValueError("Current version supports only Ray engine.")
 
-    assert isinstance(
-        dtrain, DMatrix
-    ), f"Type of `dtrain` is {type(dtrain)}, but expected {DMatrix}."
+    if not isinstance(dtrain, DMatrix):
+        raise TypeError(f"Type of `dtrain` is {type(dtrain)}, but expected {DMatrix}.")
     result = _train(dtrain, num_actors, params, *args, evals=evals, **kwargs)
     if isinstance(evals_result, dict):
         evals_result.update(result["history"])
